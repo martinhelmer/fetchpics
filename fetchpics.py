@@ -134,6 +134,8 @@ def cmd_fetch(args):
             dupe, h = is_dupe(db, path)
             if dupe:
                 dupes += 1
+                if args.delete:
+                    path.unlink()
                 print(f"  DUPE    {path.name}")
                 continue
 
@@ -162,6 +164,9 @@ def cmd_fetch(args):
             db.execute("INSERT OR IGNORE INTO files (hash, size) VALUES (?, ?)", (h, size))
             db.commit()
 
+            if args.delete:
+                path.unlink()
+
             imported += 1
             print(f"  IMPORT  {path.name} → {dest_path.name}")
 
@@ -189,6 +194,11 @@ def main():
         "--preserve-dirs",
         action="store_true",
         help="Preserve source directory structure in destination"
+    )
+    p_fetch.add_argument(
+        "--delete",
+        action="store_true",
+        help="Delete source files after successful import"
     )
 
     args = parser.parse_args()
