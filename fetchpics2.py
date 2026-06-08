@@ -127,11 +127,16 @@ def cmd_reindex(args):
     added = 0
     for path in iter_media(directory):
         try:
+            path.encode("utf-8")
+        except UnicodeEncodeError:
+            print("  SKIP    {0} (unencodable filename)".format(path), file=sys.stderr)
+            continue
+        try:
             size = os.path.getsize(path)
         except OSError as e:
             print("  SKIP    {0}: {1}".format(path, e), file=sys.stderr)
             continue
-        # OR IGNORE: re-running init must not clobber an already-computed hash.
+        # OR IGNORE: re-running reindex must not clobber an already-computed hash.
         db.execute(
             "INSERT OR IGNORE INTO files (path, size, hash) VALUES (?, ?, NULL)",
             (path, size),
@@ -174,6 +179,12 @@ def cmd_fetch(args):
     errors = 0
 
     for path in iter_media(src):
+        try:
+            path.encode("utf-8")
+        except UnicodeEncodeError:
+            errors += 1
+            print("  SKIP    {0} (unencodable filename)".format(path), file=sys.stderr)
+            continue
         try:
             size = os.path.getsize(path)
 
@@ -238,7 +249,7 @@ def cmd_fetch(args):
 
             imported += 1
             print("  IMPORT  {0} -> {1}".format(
-                os.path.basename(path), os.path.basename(dest_path)))
+                os.path.relpath(path, src), os.path.relpath(dest_path, dst)))
 
         except Exception as e:
             errors += 1
