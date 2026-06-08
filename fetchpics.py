@@ -3,8 +3,9 @@
 fetchpics — photo/video import tool with duplicate detection
 
 Usage:
-  fetchpics init <dir>       Initialize DB with contents of dir
-  fetchpics fetch <src> <dst> Copy non-duplicate files from src to dst
+  fetchpics init <dir>              Initialize DB with contents of dir
+  fetchpics fetch <src> <dst>       Copy non-duplicate files from src to dst
+  fetchpics fetch --preserve-dirs <src> <dst>  Copy while preserving directory structure
 """
 
 import argparse
@@ -137,14 +138,20 @@ def cmd_fetch(args):
                 continue
 
             # Not a dupe — copy to destination
-            dest_path = dst / path.name
+            if args.preserve_dirs:
+                rel_path = path.relative_to(src)
+                dest_path = dst / rel_path
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+            else:
+                dest_path = dst / path.name
+
             # Handle filename collision (different file, same name)
             if dest_path.exists():
                 stem = path.stem
                 suffix = path.suffix
                 counter = 1
                 while dest_path.exists():
-                    dest_path = dst / f"{stem}_{counter}{suffix}"
+                    dest_path = dest_path.parent / f"{stem}_{counter}{suffix}"
                     counter += 1
 
             shutil.copy2(path, dest_path)
@@ -178,6 +185,11 @@ def main():
     p_fetch = subparsers.add_parser("fetch", help="Import non-duplicate files")
     p_fetch.add_argument("src", help="Source directory (backup)")
     p_fetch.add_argument("dst", help="Destination directory (inbox)")
+    p_fetch.add_argument(
+        "--preserve-dirs",
+        action="store_true",
+        help="Preserve source directory structure in destination"
+    )
 
     args = parser.parse_args()
 
