@@ -14,23 +14,22 @@ import os
 import shutil
 import sqlite3
 import sys
-from pathlib import Path
 
-PHOTO_EXTENSIONS = {
+PHOTO_EXTENSIONS = set([
     ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif",
     ".heic", ".heif", ".webp", ".raw", ".cr2", ".cr3", ".nef",
     ".arw", ".orf", ".rw2", ".dng", ".pef", ".srw", ".raf",
-}
+])
 
-VIDEO_EXTENSIONS = {
+VIDEO_EXTENSIONS = set([
     ".mp4", ".mov", ".avi", ".mkv", ".m4v", ".3gp", ".wmv",
     ".flv", ".webm", ".mts", ".m2ts", ".mpg", ".mpeg",
-}
+])
 
 ALL_EXTENSIONS = PHOTO_EXTENSIONS | VIDEO_EXTENSIONS
 
 
-def open_db(db_path: Path) -> sqlite3.Connection:
+def open_db(db_path):
     db = sqlite3.connect(db_path)
     db.execute("""
         CREATE TABLE IF NOT EXISTS files (
@@ -43,33 +42,33 @@ def open_db(db_path: Path) -> sqlite3.Connection:
     return db
 
 
-def file_hash(path: Path) -> str:
-    h = hashlib.sha256()
+def file_hash(path):
+    h = hashlib.md5()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(65536), b""):
             h.update(chunk)
     return h.hexdigest()
 
 
-def is_media(path: Path) -> bool:
-    return path.suffix.lower() in ALL_EXTENSIONS
+def is_media(path):
+    _, ext = os.path.splitext(path)
+    return ext.lower() in ALL_EXTENSIONS
 
 
-def iter_media(directory: Path):
+def iter_media(directory):
     for root, _, files in os.walk(directory, followlinks=False):
         for fname in files:
-            p = Path(root) / fname
-            if is_media(p):
-                yield p
+            path = os.path.join(root, fname)
+            if is_media(path):
+                yield path
 
 
-def is_dupe(db: sqlite3.Connection, path: Path) -> tuple[bool, str | None]:
+def is_dupe(db, path):
     """Returns (is_dupe, hash). Hash is None if dupe detected by size only."""
-    size = path.stat().st_size
+    size = os.path.getsize(path)
     rows = db.execute("SELECT hash FROM files WHERE size=?", (size,)).fetchall()
     if not rows:
         return False, None
-    # Size match — need to check hash
     h = file_hash(path)
     for (existing_hash,) in rows:
         if existing_hash == h:
@@ -77,27 +76,27 @@ def is_dupe(db: sqlite3.Connection, path: Path) -> tuple[bool, str | None]:
     return False, h
 
 
-def register(db: sqlite3.Connection, path: Path, precomputed_hash: str | None = None):
-    size = path.stat().st_size
+def register(db, path, precomputed_hash=None):
+    size = os.path.getsize(path)
     h = precomputed_hash or file_hash(path)
     db.execute("INSERT OR IGNORE INTO files (hash, size) VALUES (?, ?)", (h, size))
     db.commit()
 
 
 def cmd_init(args):
-    directory = Path(args.dir).expanduser().resolve()
-    if not directory.is_dir():
-        print(f"Error: {directory} is not a directory", file=sys.stderr)
+    directory = os.path.abspath(os.path.expanduser(args.dir))
+    if not os.path.isdir(directory):
+        print("Error: {0} is not a directory".format(directory), file=sys.stderr)
         sys.exit(1)
 
-    db_path = Path(args.db).expanduser().resolve()
+    db_path = os.path.abspath(os.path.expanduser(args.db))
     db = open_db(db_path)
-    print(f"Initializing DB from {directory} ...")
+    print("Initializing DB from {0} ...".format(directory))
 
     added = 0
     skipped = 0
     for path in iter_media(directory):
-        size = path.stat().st_size
+        size = os.path.getsize(path)
         h = file_hash(path)
         existing = db.execute("SELECT 1 FROM files WHERE hash=?", (h,)).fetchone()
         if existing:
@@ -107,22 +106,25 @@ def cmd_init(args):
             added += 1
         if (added + skipped) % 100 == 0:
             db.commit()
-            print(f"  {added + skipped} files processed...", end="\r")
+            print("  {0} files processed...".format(added + skipped), end="\r")
+            sys.stdout.flush()
 
     db.commit()
-    print(f"\nDone. Added {added} files, skipped {skipped} already known.")
+    print("\nDone. Added {0} files, skipped {1} already known.".format(added, skipped))
 
 
 def cmd_fetch(args):
-    src = Path(args.src).expanduser().resolve()
-    dst = Path(args.dst).expanduser().resolve()
+    src = os.path.abspath(os.path.expanduser(args.src))
+    dst = os.path.abspath(os.path.expanduser(args.dst))
 
-    if not src.is_dir():
-        print(f"Error: {src} is not a directory", file=sys.stderr)
+    if not os.path.isdir(src):
+        print("Error: {0} is not a directory".format(src), file=sys.stderr)
         sys.exit(1)
 
-    dst.mkdir(parents=True, exist_ok=True)
-    db_path = Path(args.db).expanduser().resolve()
+    if not os.path.exists(dst):
+        os.makedirs(dst)
+
+    db_path = os.path.abspath(os.path.expanduser(args.db))
     db = open_db(db_path)
 
     imported = 0
@@ -135,46 +137,45 @@ def cmd_fetch(args):
             if dupe:
                 dupes += 1
                 if args.delete:
-                    path.unlink()
-                print(f"  DUPE    {path.name}")
+                    os.unlink(path)
+                print("  DUPE    {0}".format(os.path.basename(path)))
                 continue
 
-            # Not a dupe — copy to destination
             if args.preserve_dirs:
-                rel_path = path.relative_to(src)
-                dest_path = dst / rel_path
-                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                rel_path = os.path.relpath(path, src)
+                dest_path = os.path.join(dst, rel_path)
+                dest_dir = os.path.dirname(dest_path)
+                if not os.path.exists(dest_dir):
+                    os.makedirs(dest_dir)
             else:
-                dest_path = dst / path.name
+                dest_path = os.path.join(dst, os.path.basename(path))
 
-            # Handle filename collision (different file, same name)
-            if dest_path.exists():
-                stem = path.stem
-                suffix = path.suffix
+            if os.path.exists(dest_path):
+                base, ext = os.path.splitext(os.path.basename(path))
+                dest_dir = os.path.dirname(dest_path)
                 counter = 1
-                while dest_path.exists():
-                    dest_path = dest_path.parent / f"{stem}_{counter}{suffix}"
+                while os.path.exists(dest_path):
+                    dest_path = os.path.join(dest_dir, "{0}_{1}{2}".format(base, counter, ext))
                     counter += 1
 
             shutil.copy2(path, dest_path)
 
-            # Register in DB — use precomputed hash if we have it
             h = h or file_hash(path)
-            size = path.stat().st_size
+            size = os.path.getsize(path)
             db.execute("INSERT OR IGNORE INTO files (hash, size) VALUES (?, ?)", (h, size))
             db.commit()
 
             if args.delete:
-                path.unlink()
+                os.unlink(path)
 
             imported += 1
-            print(f"  IMPORT  {path.name} → {dest_path.name}")
+            print("  IMPORT  {0} -> {1}".format(os.path.basename(path), os.path.basename(dest_path)))
 
         except Exception as e:
             errors += 1
-            print(f"  ERROR   {path.name}: {e}", file=sys.stderr)
+            print("  ERROR   {0}: {1}".format(os.path.basename(path), str(e)), file=sys.stderr)
 
-    print(f"\nDone. Imported: {imported}, Dupes skipped: {dupes}, Errors: {errors}")
+    print("\nDone. Imported: {0}, Dupes skipped: {1}, Errors: {2}".format(imported, dupes, errors))
 
 
 def main():
