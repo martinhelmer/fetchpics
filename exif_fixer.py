@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""
+exif_fixer — fix EXIF data: add photographer based on camera, add date from path/filename
+
+Usage:
+  exif_fixer set-photographer <src_dir>    Set photographer for all files based on camera
+  exif_fixer set-dates <src_dir>           Set DateTimeOriginal from filename/path/other tags
+  exif_fixer report <src_dir>              Show assignments preview
+"""
+
+import argparse
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+
+
+CAMERA_TO_PHOTOGRAPHER = {
+    ('motorola', 'moto g pure'): 'Gabriel',
+    ('samsung', 'SM-F707W'): 'Stephanie',
+    ('samsung', 'SM-G973W'): 'Martin',
+    ('samsung', 'SAMSUNG-SM-G890A'): 'Sebastian',
+}
+
+
+def iter_media(directory):
+    """Iterate over all media files recursively."""
+    for root, _, files in os.walk(directory, followlinks=False):
+        for fname in files:
+            path = os.path.join(root, fname)
+            _, ext = os.path.splitext(path)
+            if ext.lower() in ('.jpg', '.jpeg', '.png', '.heic', '.gif', '.bmp', '.webp', '.tiff'):
+                yield path
+
+
+def get_camera_info(path):
+    """Get Make and Model from file EXIF."""
+    try:
+        result = subprocess.run(
+            ['exiftool', '-json', '-Make', '-Model', path],
+            capture_output=True, text=True, check=True
+        )
+        data = json.loads(result.stdout)[0]
+        make = data.get('Make', '').lower()
+        model = data.get('Model', '')
+        return (make, model)
+    except Exception:
+        return None
+
+
+def get_photographer(make, model):
+    """Map camera to photographer name."""
+    key = (make.lower(), model)
+    if key in CAMERA_TO_PHOTOGRAPHER:
+        return CAMERA_TO_PHOTOGRAPHER[key]
+    return None
+
+
+def parse_datetime_from_filename(filename):
+    """Extract datetime from filename patterns: YYYYMMDD_HHMMSS, IMG_YYYYMMDD_HHMMSS, etc."""
+    name = os.path.splitext(filename)[0]
+
+    patterns = [
+        r'(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})',
+        r'IMG_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})',
+        r'(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})',
+        r'(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})',
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, name)
+        if match:
+            groups = match.groups()
+            try:
+                return f"{groups[0]}:{groups[1]}:{groups[2]} {groups[3]}:{groups[4]}:{groups[5]}"
+            except (IndexError, ValueError):
+                pass
+
+    return None
+
+
+def parse_datetime_from_path(full_path):
+    """Extract datetime from path patterns: Day7 - 12 Aug, 2025/08/12, etc."""
+    path_parts = full_path.replace('\\', '/').split('/')
+
+    for part in path_parts:
+        match = re.search(r'Day\d+\s*[-–]\s*(\d{2})\s+(\w+)', part)
+        if match:
+            day, month_name = match.groups()
+            month_map = {
+                'jan': '01', 'feb': '02', 'mar': '03', 'apr': '04',
+                'may': '05', 'jun': '06', 'jul': '07', 'aug': '08',
+                'sep': '09', 'oct': '10', 'nov': '11', 'dec': '12',
+            }
+            month = month_map.get(month_name.lower())
+            if month:
+                year = str(datetime.datetime.now().year)
+                return f"{year}:{month}:{day} 12:00:00"
+
+    return None
+
+
+def get_exif_all_dates(path):
+    """Get all date-related EXIF tags from file."""
+    try:
+        result = subprocess.run(
+            ['exiftool', '-json', '-DateTimeOriginal', '-CreateDate', '-ModifyDate', '-FileModifyDate', path],
+            capture_output=True, text=True, check=True
+        )
+        data = json.loads(result.stdout)[0]
+        return {
+            'DateTimeOriginal': data.get('DateTimeOriginal'),
+            'CreateDate': data.get('CreateDate'),
+            'ModifyDate': data.get('ModifyDate'),
+            'FileModifyDate': data.get('FileModifyDate'),
+        }
+    except Exception:
+        return {}
+
+
+def detect_datetime(path):
+    """Detect datetime from EXIF, filename, path, or file mtime (in order of priority)."""
+    exif_dates = get_exif_all_dates(path)
+
+    if exif_dates.get('DateTimeOriginal'):
+        return exif_dates['DateTimeOriginal']
+
+    datetime_from_filename = parse_datetime_from_filename(os.path.basename(path))
+    if datetime_from_filename:
+        return datetime_from_filename
+
+    datetime_from_path = parse_datetime_from_path(path)
+    if datetime_from_path:
+        return datetime_from_path
+
+    if exif_dates.get('CreateDate'):
+        return exif_dates['CreateDate']
+
+    if exif_dates.get('ModifyDate'):
+        return exif_dates['ModifyDate']
+
+    try:
+        mtime = os.path.getmtime(path)
+        dt = datetime.datetime.fromtimestamp(mtime)
+        return dt.strftime('%Y:%m:%d %H:%M:%S')
+    except Exception:
+        pass
+
+    return None
+
+
+def set_exif_artist(path, photographer):
+    """Set Artist EXIF field on file."""
+    try:
+        subprocess.run(
+            ['exiftool', '-overwrite_original', f'-Artist={photographer}', path],
+            capture_output=True, check=True
+        )
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+
+def set_exif_datetime(path, datetime_str):
+    """Set DateTimeOriginal EXIF field on file."""
+    try:
+        subprocess.run(
+            ['exiftool', '-overwrite_original', f'-DateTimeOriginal={datetime_str}', path],
+            capture_output=True, check=True
+        )
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+
+def set_photographers(src_dir):
+    """Set photographer EXIF field on all photos based on camera model."""
+    stats = defaultdict(lambda: {'updated': 0, 'skipped': 0, 'error': 0})
+    total = 0
+
+    for i, path in enumerate(iter_media(src_dir), 1):
+        total += 1
+        camera = get_camera_info(path)
+        if not camera:
+            stats['unknown']['skipped'] += 1
+            continue
+
+        make, model = camera
+        photographer = get_photographer(make, model)
+        if not photographer:
+            stats['unknown']['skipped'] += 1
+            continue
+
+        if set_exif_artist(path, photographer):
+            stats[photographer]['updated'] += 1
+        else:
+            stats[photographer]['error'] += 1
+
+        if i % 50 == 0:
+            print(f"  Processed {i} files...", end='\r')
+            sys.stdout.flush()
+
+    print(f"\nProcessed {total} files\n")
+    for photographer, counts in sorted(stats.items()):
+        print(f"{photographer}:")
+        print(f"  Updated: {counts['updated']}")
+        if counts['error'] > 0:
+            print(f"  Errors: {counts['error']}")
+
+
+def set_dates(src_dir):
+    """Set DateTimeOriginal on all photos from filename/path/other EXIF tags."""
+    stats = {'updated': 0, 'skipped': 0, 'error': 0, 'already_set': 0}
+    total = 0
+
+    for i, path in enumerate(iter_media(src_dir), 1):
+        total += 1
+        exif_dates = get_exif_all_dates(path)
+
+        if exif_dates.get('DateTimeOriginal'):
+            stats['already_set'] += 1
+            continue
+
+        datetime_str = detect_datetime(path)
+        if not datetime_str:
+            stats['skipped'] += 1
+            continue
+
+        if set_exif_datetime(path, datetime_str):
+            stats['updated'] += 1
+        else:
+            stats['error'] += 1
+
+        if i % 50 == 0:
+            print(f"  Processed {i} files...", end='\r')
+            sys.stdout.flush()
+
+    print(f"\nProcessed {total} files\n")
+    print(f"Updated: {stats['updated']}")
+    print(f"Already set: {stats['already_set']}")
+    print(f"Skipped (no date found): {stats['skipped']}")
+    if stats['error'] > 0:
+        print(f"Errors: {stats['error']}")
+
+
+def report_photographers(src_dir):
+    """Preview photographer assignments."""
+    assignments = defaultdict(int)
+    unknown = 0
+
+    for path in iter_media(src_dir):
+        camera = get_camera_info(path)
+        if not camera:
+            unknown += 1
+            continue
+
+        make, model = camera
+        photographer = get_photographer(make, model)
+        if photographer:
+            assignments[photographer] += 1
+        else:
+            unknown += 1
+
+    print("Photographer assignments:\n")
+    for photographer, count in sorted(assignments.items(), key=lambda x: -x[1]):
+        print(f"  {photographer}: {count} files")
+    if unknown:
+        print(f"  Unknown: {unknown} files")
+
+
+def report_dates(src_dir):
+    """Preview date detection for files missing DateTimeOriginal."""
+    has_date = 0
+    can_detect = 0
+    cannot_detect = 0
+
+    for path in iter_media(src_dir):
+        exif_dates = get_exif_all_dates(path)
+        if exif_dates.get('DateTimeOriginal'):
+            has_date += 1
+            continue
+
+        datetime_str = detect_datetime(path)
+        if datetime_str:
+            can_detect += 1
+        else:
+            cannot_detect += 1
+
+    total = has_date + can_detect + cannot_detect
+    print(f"Date detection preview for {total} files:\n")
+    print(f"  Already have DateTimeOriginal: {has_date} ({100*has_date/total:.1f}%)")
+    print(f"  Can detect from path/filename: {can_detect} ({100*can_detect/total:.1f}%)")
+    print(f"  Cannot detect: {cannot_detect} ({100*cannot_detect/total:.1f}%)")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Fix EXIF data: add photographer & dates")
+    subparsers = parser.add_subparsers(dest="command")
+
+    subparsers.add_parser("set-photographer", help="Set photographer based on camera model")
+    subparsers.add_parser("set-dates", help="Set DateTimeOriginal from filename/path/other tags")
+    subparsers.add_parser("report", help="Preview all assignments")
+
+    parser.add_argument("src_dir", help="Source directory")
+
+    args = parser.parse_args()
+
+    src_dir = os.path.abspath(os.path.expanduser(args.src_dir))
+    if not os.path.isdir(src_dir):
+        print(f"Error: {src_dir} is not a directory", file=sys.stderr)
+        sys.exit(1)
+
+    if args.command == "set-photographer":
+        set_photographers(src_dir)
+    elif args.command == "set-dates":
+        set_dates(src_dir)
+    elif args.command == "report":
+        print("=== Photographer Assignments ===\n")
+        report_photographers(src_dir)
+        print("\n=== Date Detection ===\n")
+        report_dates(src_dir)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
