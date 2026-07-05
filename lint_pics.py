@@ -154,7 +154,7 @@ def check_heuristics(filepath):
         return 'HIGH', score, reasons, cached_dims, cached_duration
 
     # IMAGE-SPECIFIC HEURISTICS (still relatively fast)
-    if ext.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.tiff'}:
+    if ext.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.tiff', '.tif'}:
         dims, mode = get_image_dimensions(filepath)
         cached_dims = dims
 
@@ -210,7 +210,7 @@ def check_heuristics(filepath):
 
 
 def get_dimensions_str(filepath, ext, cached_dims=None, cached_duration=None):
-    if ext.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.tiff'}:
+    if ext.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.tiff', '.tif'}:
         dims = cached_dims or get_image_dimensions(filepath)[0]
         return f"{dims[0]}x{dims[1]}" if dims else "n/a"
     elif ext.lower() in {'.mp4', '.mov', '.avi', '.mkv', '.webm'}:
@@ -319,9 +319,9 @@ def main():
     parser.add_argument('path', nargs='?', help='Path to photo collection')
     parser.add_argument('--output', default='lint_report.csv', help='CSV output file')
     parser.add_argument('--min-flag', choices=['LOW', 'MEDIUM', 'HIGH'], default='HIGH',
-                        help='Minimum flag level to report (default: HIGH)')
-    parser.add_argument('--delete', action='store_true', help='Delete HIGH candidates after confirmation')
-    parser.add_argument('--tag', action='store_true', help='Tag candidates in EXIF for review (HIGH/MEDIUM/LOW)')
+                        help='Minimum flag level to display/delete/tag (default: HIGH)')
+    parser.add_argument('--delete', action='store_true', help='Delete candidates at min-flag level after confirmation')
+    parser.add_argument('--tag', action='store_true', help='Tag candidates at min-flag level in EXIF Keywords')
     parser.add_argument('--delete-from-report', action='store_true', help='Delete candidates from CSV report (based on min-flag)')
     parser.add_argument('--label-from-report', action='store_true', help='Tag candidates from CSV report (based on min-flag)')
 
@@ -426,7 +426,7 @@ def main():
         lint_collection(args.path, args.output, min_flag='LOW')
 
         # Read candidates from CSV and filter by min_flag
-        with open(args.output, 'r', newline='') as f:
+        with open(args.output, 'r', newline='', encoding='utf-8', errors='replace') as f:
             reader = csv.DictReader(f)
             all_candidates = filter_candidates_by_flag(list(reader), args.min_flag)
     else:
@@ -464,7 +464,7 @@ def main():
 
     elif args.delete and candidates:
         print(f"\n=== Deletion Preview ===")
-        print(f"The following {len(candidates)} HIGH-confidence files will be deleted:")
+        print(f"The following {len(candidates)} files (min-flag={args.min_flag}) will be deleted:")
         for c in candidates[:10]:
             print(f"  {c['path']}")
         if len(candidates) > 10:
