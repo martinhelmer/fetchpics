@@ -11,8 +11,6 @@ from pathlib import Path
 from datetime import datetime
 from statistics import stdev
 from collections import Counter
-from PIL import Image
-from PIL.ExifTags import TAGS
 
 # Same media extensions as fetchpics.py
 PHOTO_EXTENSIONS = {
@@ -62,24 +60,23 @@ KNOWN_APP_KEYWORDS = {
     'tiktok', 'telegram', 'facebook', 'messenger', 'imessage'
 }
 
+FLAG_LEVELS = {'LOW': 0, 'MEDIUM': 1, 'HIGH': 2}
+
 
 def get_image_dimensions(filepath):
+    """Get image dimensions via ImageMagick identify."""
     try:
-        with Image.open(filepath) as img:
-            return img.size, img.mode
-    except Exception:
-        return None, None
-
-
-def get_exif_data(filepath):
-    try:
-        with Image.open(filepath) as img:
-            exif = img._getexif() if hasattr(img, '_getexif') else None
-            if exif is None:
-                return {}
-            return {TAGS.get(k, k): v for k, v in exif.items()}
-    except Exception:
-        return {}
+        result = subprocess.run(
+            ['identify', '-format', '%w %h', filepath],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            parts = result.stdout.strip().split()
+            if len(parts) == 2:
+                return (int(parts[0]), int(parts[1])), None
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+        pass
+    return None, None
 
 
 def get_video_info(filepath):
@@ -107,11 +104,13 @@ def check_heuristics(filepath):
     filename = path_obj.name
     file_size = os.path.getsize(filepath)
     ext = path_obj.suffix.lower()
+    cached_dims = None
+    cached_duration = None
 
     # FAST CHECKS (early exit if score >= 3)
 
     # H1: Small file size
-    if ext in PHOTO_EXTENSIONS | VIDEO_EXTENSIONS and file_size < 50 * 1024:
+    if ext in ALL_MEDIA_EXTENSIONS and file_size < 50 * 1024:
         score += 1
         reasons.append('H1_small_size')
 
@@ -133,7 +132,7 @@ def check_heuristics(filepath):
 
     # Early exit: if we already have HIGH confidence from fast checks
     if score >= 3:
-        return 'HIGH', score, reasons
+        return 'HIGH', score, reasons, cached_dims, cached_duration
 
     # H10: Suspicious filename patterns
     if re.match(r'^[a-f0-9]{32,}$', filename.split('.')[0]):
@@ -152,11 +151,12 @@ def check_heuristics(filepath):
 
     # Early exit: if we already have HIGH confidence
     if score >= 3:
-        return 'HIGH', score, reasons
+        return 'HIGH', score, reasons, cached_dims, cached_duration
 
     # IMAGE-SPECIFIC HEURISTICS (still relatively fast)
     if ext.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.tiff'}:
         dims, mode = get_image_dimensions(filepath)
+        cached_dims = dims
 
         # H2: Small dimensions
         if dims and (dims[0] < 200 or dims[1] < 200):
@@ -175,69 +175,21 @@ def check_heuristics(filepath):
 
         # Early exit: if we already have HIGH confidence before expensive EXIF checks
         if score >= 3:
-            return 'HIGH', score, reasons
+            return 'HIGH', score, reasons, cached_dims, cached_duration
 
-        # EXPENSIVE CHECKS (pixel analysis, EXIF) - only if not already HIGH
-        if ext.lower() in {'.jpg', '.jpeg', '.png'}:
-            # H8: Suspicious image properties
-            try:
-                with Image.open(filepath) as img:
-                    # Palette mode check
-                    if mode == 'P':
-                        score += 1
-                        reasons.append('H8_palette_mode')
-
-                    # Transparent PNG check
-                    if mode == 'RGBA':
-                        alpha = img.split()[-1]
-                        histogram = alpha.histogram()
-                        transparent_pixels = sum(histogram[:128])
-                        total_pixels = sum(histogram)
-                        if total_pixels > 0 and transparent_pixels > 0.8 * total_pixels:
-                            score += 1
-                            reasons.append('H8_mostly_transparent')
-
-                    # Near-solid color check
-                    small_img = img.convert('L').resize((16, 16))
-                    histogram = small_img.histogram()
-                    if sum(1 for h in histogram if h > 0) < 5:
-                        score += 1
-                        reasons.append('H8_near_solid')
-
-                    # Square aspect ratio
-                    if dims[0] == dims[1] and dims[0] < 512:
-                        score += 1
-                        reasons.append('H8_square_icon')
-            except Exception:
-                pass
-
-            # Early exit after expensive image analysis
-            if score >= 3:
-                return 'HIGH', score, reasons
-
-            # H5 & H6: EXIF analysis (only for JPEG/PNG formats that support it)
-            exif = get_exif_data(filepath)
-
-            if not exif:
-                score += 1
-                reasons.append('H5_no_exif')
-            else:
-                software = str(exif.get('Software', '')).lower()
-                if any(keyword in software for keyword in KNOWN_APP_KEYWORDS):
-                    score += 1
-                    reasons.append('H6_app_software')
-
-                if not exif.get('Model') and not exif.get('Make'):
-                    score += 1
-                    reasons.append('H6_no_camera_model')
+        # H8: Square aspect ratio (simple dimension check)
+        if dims and dims[0] == dims[1] and dims[0] < 512:
+            score += 1
+            reasons.append('H8_square_icon')
 
     # Early exit before expensive video checks (ffprobe)
     if score >= 3:
-        return 'HIGH', score, reasons
+        return 'HIGH', score, reasons, cached_dims, cached_duration
 
     # VIDEO-SPECIFIC HEURISTICS (expensive - ffprobe subprocess)
     if ext.lower() in {'.mp4', '.mov', '.avi', '.mkv', '.webm'}:
         duration, has_audio = get_video_info(filepath)
+        cached_duration = duration
 
         if duration is not None:
             # H12: Short duration
@@ -254,15 +206,15 @@ def check_heuristics(filepath):
     flag_map = {3: 'HIGH', 2: 'MEDIUM', 1: 'LOW', 0: 'SKIP'}
     flag = flag_map.get(min(score, 3), 'SKIP')
 
-    return flag, score, reasons
+    return flag, score, reasons, cached_dims, cached_duration
 
 
-def get_dimensions_str(filepath, ext):
+def get_dimensions_str(filepath, ext, cached_dims=None, cached_duration=None):
     if ext.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.tiff'}:
-        dims, _ = get_image_dimensions(filepath)
+        dims = cached_dims or get_image_dimensions(filepath)[0]
         return f"{dims[0]}x{dims[1]}" if dims else "n/a"
     elif ext.lower() in {'.mp4', '.mov', '.avi', '.mkv', '.webm'}:
-        duration, _ = get_video_info(filepath)
+        duration = cached_duration or get_video_info(filepath)[0]
         return f"duration={duration:.1f}s" if duration is not None else "n/a"
     return "n/a"
 
@@ -279,11 +231,18 @@ def tag_exif(filepath, tag_value):
         return False
 
 
+def filter_candidates_by_flag(candidates, min_flag):
+    """Filter candidate dicts by flag_level threshold."""
+    if min_flag not in FLAG_LEVELS:
+        raise ValueError(f"Invalid min_flag '{min_flag}'. Must be one of: {', '.join(FLAG_LEVELS.keys())}")
+    min_level = FLAG_LEVELS[min_flag]
+    return [c for c in candidates if FLAG_LEVELS.get(c['flag_level'], -1) >= min_level]
+
+
 def lint_collection(root_path, output_file, min_flag='HIGH'):
-    flag_levels = {'LOW': 0, 'MEDIUM': 1, 'HIGH': 2}
-    if min_flag not in flag_levels:
-        raise ValueError(f"Invalid min_flag '{min_flag}'. Must be one of: {', '.join(flag_levels.keys())}")
-    min_level = flag_levels[min_flag]
+    if min_flag not in FLAG_LEVELS:
+        raise ValueError(f"Invalid min_flag '{min_flag}'. Must be one of: {', '.join(FLAG_LEVELS.keys())}")
+    min_level = FLAG_LEVELS[min_flag]
 
     candidates = []
     total_files = 0
@@ -308,15 +267,16 @@ def lint_collection(root_path, output_file, min_flag='HIGH'):
                 print(f"  Scanned {total_files} files, {len(candidates)} candidates found...", flush=True)
 
             try:
-                flag, score, reasons = check_heuristics(filepath)
+                flag, score, reasons, cached_dims, cached_duration = check_heuristics(filepath)
 
                 if flag == 'SKIP':
                     skipped += 1
                     continue
 
-                dimensions = get_dimensions_str(filepath, ext)
+                dimensions = get_dimensions_str(filepath, ext, cached_dims, cached_duration)
                 file_size = os.path.getsize(filepath)
                 rel_path = os.path.relpath(filepath, root_path)
+                reasons_str = '; '.join(reasons)
 
                 candidate = {
                     'path': rel_path,
@@ -324,20 +284,20 @@ def lint_collection(root_path, output_file, min_flag='HIGH'):
                     'dimensions': dimensions,
                     'flag_level': flag,
                     'score': score,
-                    'reasons': '; '.join(reasons)
+                    'reasons': reasons_str
                 }
                 candidates.append(candidate)
 
                 # Print immediately if meets display threshold
-                if flag_levels[flag] >= min_level:
+                if FLAG_LEVELS[flag] >= min_level:
                     print(f"[{flag}] {rel_path}")
-                    print(f"      size={file_size} dims={dimensions} reasons={'; '.join(reasons)}")
+                    print(f"      size={file_size} dims={dimensions} reasons={reasons_str}")
 
             except Exception as e:
                 print(f"Error processing {filepath}: {e}", file=sys.stderr)
 
     # Write CSV with ALL candidates
-    with open(output_file, 'w', newline='') as f:
+    with open(output_file, 'w', newline='', encoding='utf-8', errors='replace') as f:
         writer = csv.DictWriter(f, fieldnames=['path', 'size_bytes', 'dimensions', 'flag_level', 'score', 'reasons'])
         writer.writeheader()
         writer.writerows(candidates)
@@ -350,43 +310,132 @@ def lint_collection(root_path, output_file, min_flag='HIGH'):
     print(f"Candidates found: {len(candidates)}")
     print(f"Full CSV written to: {output_file}")
 
-    # Return HIGH candidates for potential deletion
-    return [c for c in candidates if c['flag_level'] == 'HIGH']
+    # Return candidates meeting min_flag threshold
+    return [c for c in candidates if FLAG_LEVELS[c['flag_level']] >= min_level]
 
 
 def main():
     parser = argparse.ArgumentParser(description='Lint photo/video collection for unwanted files')
-    parser.add_argument('path', help='Path to photo collection')
+    parser.add_argument('path', nargs='?', help='Path to photo collection')
     parser.add_argument('--output', default='lint_report.csv', help='CSV output file')
     parser.add_argument('--min-flag', choices=['LOW', 'MEDIUM', 'HIGH'], default='HIGH',
                         help='Minimum flag level to report (default: HIGH)')
     parser.add_argument('--delete', action='store_true', help='Delete HIGH candidates after confirmation')
     parser.add_argument('--tag', action='store_true', help='Tag candidates in EXIF for review (HIGH/MEDIUM/LOW)')
+    parser.add_argument('--delete-from-report', action='store_true', help='Delete candidates from CSV report (based on min-flag)')
+    parser.add_argument('--label-from-report', action='store_true', help='Tag candidates from CSV report (based on min-flag)')
 
     args = parser.parse_args()
 
-    if not os.path.isdir(args.path):
-        print(f"Error: {args.path} is not a directory", file=sys.stderr)
-        sys.exit(1)
+    # Validate arguments
+    if args.delete_from_report or args.label_from_report:
+        # Report-based modes need both path and report
+        if not args.path:
+            print(f"Error: path argument required for --delete-from-report or --label-from-report", file=sys.stderr)
+            sys.exit(1)
+        if not os.path.isdir(args.path):
+            print(f"Error: {args.path} is not a directory", file=sys.stderr)
+            sys.exit(1)
+        if not os.path.exists(args.output):
+            print(f"Error: report file {args.output} not found", file=sys.stderr)
+            sys.exit(1)
+    else:
+        # Scan modes need path
+        if not args.path:
+            parser.print_help()
+            sys.exit(1)
+        if not os.path.isdir(args.path):
+            print(f"Error: {args.path} is not a directory", file=sys.stderr)
+            sys.exit(1)
 
     candidates = []
     all_candidates = []
 
-    if args.tag:
-        # Fresh scan and tag all candidates (all levels)
-        lint_collection(args.path, args.output, min_flag='LOW')  # Get all levels
+    # Load from report for report-based modes
+    if args.delete_from_report:
+        with open(args.output, 'r', newline='', encoding='utf-8', errors='replace') as f:
+            reader = csv.DictReader(f)
+            candidates = filter_candidates_by_flag(list(reader), args.min_flag)
 
-        # Read candidates from CSV for tagging
+        if not candidates:
+            print(f"No candidates found in {args.output} matching {args.min_flag}")
+            sys.exit(0)
+
+        print(f"\n=== Delete from Report ===")
+        print(f"Will delete {len(candidates)} files (min-flag={args.min_flag}):")
+        for c in candidates[:10]:
+            print(f"  {c['path']}")
+        if len(candidates) > 10:
+            print(f"  ... and {len(candidates) - 10} more")
+
+        response = input("\nProceed with deletion? (yes/no): ").strip().lower()
+        if response == 'yes':
+            deleted = 0
+            for c in candidates:
+                filepath = os.path.join(args.path, c['path'])
+                try:
+                    os.remove(filepath)
+                    deleted += 1
+                except FileNotFoundError:
+                    pass
+                except Exception as e:
+                    print(f"Failed to delete {c['path']}: {e}", file=sys.stderr)
+            print(f"\nDeleted {deleted}/{len(candidates)} files")
+        else:
+            print("Deletion cancelled")
+        return
+
+    if args.label_from_report:
+        with open(args.output, 'r', newline='', encoding='utf-8', errors='replace') as f:
+            reader = csv.DictReader(f)
+            all_candidates = filter_candidates_by_flag(list(reader), args.min_flag)
+
+        if not all_candidates:
+            print(f"No candidates found in {args.output} matching {args.min_flag}")
+            sys.exit(0)
+
+        print(f"\n=== Label from Report ===")
+        print(f"Will tag {len(all_candidates)} candidates in EXIF Keywords (min-flag={args.min_flag}):")
+
+        level_counts = Counter(c['flag_level'] for c in all_candidates)
+        for level in ['HIGH', 'MEDIUM', 'LOW']:
+            if level in level_counts:
+                print(f"  {level}: {level_counts[level]}")
+
+        response = input("\nProceed with tagging? (yes/no): ").strip().lower()
+        if response == 'yes':
+            tagged = 0
+            failed = 0
+            for c in all_candidates:
+                filepath = os.path.join(args.path, c['path'])
+                tag = f"LINT_{c['flag_level']}"
+                if tag_exif(filepath, tag):
+                    tagged += 1
+                else:
+                    failed += 1
+
+            print(f"\nTagged {tagged}/{len(all_candidates)} files in EXIF Keywords")
+            if failed > 0:
+                print(f"Failed: {failed}")
+        else:
+            print("Tagging cancelled")
+        return
+
+    if args.tag:
+        # Fresh scan to get all levels in CSV
+        lint_collection(args.path, args.output, min_flag='LOW')
+
+        # Read candidates from CSV and filter by min_flag
         with open(args.output, 'r', newline='') as f:
             reader = csv.DictReader(f)
-            all_candidates = [c for c in reader if c['flag_level'] != 'SKIP']
+            all_candidates = filter_candidates_by_flag(list(reader), args.min_flag)
     else:
         # Fresh scan for preview/delete mode
         candidates = lint_collection(args.path, args.output, args.min_flag)
 
     if args.tag:
         print(f"\n=== Tagging Mode ===")
-        print(f"Will tag {len(all_candidates)} candidates in EXIF Keywords:")
+        print(f"Will tag {len(all_candidates)} candidates in EXIF Keywords (min-flag={args.min_flag}):")
 
         # Count by level
         level_counts = Counter(c['flag_level'] for c in all_candidates)
