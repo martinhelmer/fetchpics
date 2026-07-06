@@ -29,14 +29,17 @@ CAMERA_TO_PHOTOGRAPHER = {
 PHOTO_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.heic', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
 
 
-def iter_media(directory):
-    """Iterate over all media files recursively."""
-    for root, _, files in os.walk(directory, followlinks=False):
-        for fname in files:
-            path = os.path.join(root, fname)
-            _, ext = os.path.splitext(path)
-            if ext.lower() in PHOTO_EXTENSIONS:
-                yield path
+def iter_media(directories):
+    """Iterate over all media files recursively from one or more directories."""
+    if isinstance(directories, str):
+        directories = [directories]
+    for directory in directories:
+        for root, _, files in os.walk(directory, followlinks=False):
+            for fname in files:
+                path = os.path.join(root, fname)
+                _, ext = os.path.splitext(path)
+                if ext.lower() in PHOTO_EXTENSIONS:
+                    yield path
 
 
 def iter_media_with_exif(directory):
@@ -302,28 +305,35 @@ def main():
     parser = argparse.ArgumentParser(description="Fix EXIF data: add photographer & dates")
     subparsers = parser.add_subparsers(dest="command")
 
-    subparsers.add_parser("set-photographer", help="Set photographer based on camera model")
-    subparsers.add_parser("set-dates", help="Set DateTimeOriginal from filename/path/other tags")
-    subparsers.add_parser("report", help="Preview all assignments")
+    sp1 = subparsers.add_parser("set-photographer", help="Set photographer based on camera model")
+    sp1.add_argument("src_dir", nargs='+', help="Source directory or directories")
 
-    parser.add_argument("src_dir", help="Source directory")
+    sp2 = subparsers.add_parser("set-dates", help="Set DateTimeOriginal from filename/path/other tags")
+    sp2.add_argument("src_dir", nargs='+', help="Source directory or directories")
+
+    sp3 = subparsers.add_parser("report", help="Preview all assignments")
+    sp3.add_argument("src_dir", nargs='+', help="Source directory or directories")
 
     args = parser.parse_args()
 
-    src_dir = os.path.abspath(os.path.expanduser(args.src_dir))
-    if not os.path.isdir(src_dir):
-        print(f"Error: {src_dir} is not a directory", file=sys.stderr)
-        sys.exit(1)
+    # Expand and validate all directories
+    src_dirs = []
+    for src_arg in args.src_dir:
+        src_dir = os.path.abspath(os.path.expanduser(src_arg))
+        if not os.path.isdir(src_dir):
+            print(f"Error: {src_dir} is not a directory", file=sys.stderr)
+            sys.exit(1)
+        src_dirs.append(src_dir)
 
     if args.command == "set-photographer":
-        set_photographers(src_dir)
+        set_photographers(src_dirs)
     elif args.command == "set-dates":
-        set_dates(src_dir)
+        set_dates(src_dirs)
     elif args.command == "report":
         print("=== Photographer Assignments ===\n")
-        report_photographers(src_dir)
+        report_photographers(src_dirs)
         print("\n=== Date Detection ===\n")
-        report_dates(src_dir)
+        report_dates(src_dirs)
     else:
         parser.print_help()
 
