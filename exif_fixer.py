@@ -32,7 +32,7 @@ def iter_media(directory):
         for fname in files:
             path = os.path.join(root, fname)
             _, ext = os.path.splitext(path)
-            if ext.lower() in ('.jpg', '.jpeg', '.png', '.heic', '.gif', '.bmp', '.webp', '.tiff'):
+            if ext.lower() in ('.jpg', '.jpeg', '.png', '.heic', '.gif', '.bmp', '.webp', '.tiff', '.tif'):
                 yield path
 
 
@@ -103,6 +103,34 @@ def parse_datetime_from_path(full_path):
     return None
 
 
+def read_exif_batch(paths):
+    """Read EXIF data for multiple files in one exiftool call. Returns dict: path -> exif_data."""
+    if not paths:
+        return {}
+    try:
+        result = subprocess.run(
+            ['exiftool', '-json', '-DateTimeOriginal', '-CreateDate', '-ModifyDate',
+             '-FileModifyDate', '-Make', '-Model'] + list(paths),
+            capture_output=True, text=True, check=True, timeout=60
+        )
+        data = json.loads(result.stdout)
+        cache = {}
+        for entry in data:
+            path = entry.get('SourceFile')
+            if path:
+                cache[path] = {
+                    'DateTimeOriginal': entry.get('DateTimeOriginal'),
+                    'CreateDate': entry.get('CreateDate'),
+                    'ModifyDate': entry.get('ModifyDate'),
+                    'FileModifyDate': entry.get('FileModifyDate'),
+                    'Make': entry.get('Make', '').lower(),
+                    'Model': entry.get('Model', ''),
+                }
+        return cache
+    except Exception:
+        return {}
+
+
 def get_exif_all_dates(path):
     """Get all date-related EXIF tags from file."""
     try:
@@ -124,7 +152,11 @@ def get_exif_all_dates(path):
 def detect_datetime(path):
     """Detect datetime from EXIF, filename, path, or file mtime (in order of priority)."""
     exif_dates = get_exif_all_dates(path)
+    return detect_datetime_with_cache(path, exif_dates)
 
+
+def detect_datetime_with_cache(path, exif_dates):
+    """Detect datetime using pre-read EXIF data to avoid re-reading."""
     if exif_dates.get('DateTimeOriginal'):
         return exif_dates['DateTimeOriginal']
 
@@ -152,27 +184,20 @@ def detect_datetime(path):
     return None
 
 
-def set_exif_artist(path, photographer):
-    """Set Artist EXIF field on file."""
-    try:
-        subprocess.run(
-            ['exiftool', '-overwrite_original', f'-Artist={photographer}', path],
-            capture_output=True, check=True
-        )
+def set_exif_fields(path, photographer=None, datetime_str=None):
+    """Set Artist and/or DateTimeOriginal EXIF fields in one call."""
+    if not photographer and not datetime_str:
         return True
-    except subprocess.CalledProcessError:
-        return False
-
-
-def set_exif_datetime(path, datetime_str):
-    """Set DateTimeOriginal EXIF field on file."""
     try:
-        subprocess.run(
-            ['exiftool', '-overwrite_original', f'-DateTimeOriginal={datetime_str}', path],
-            capture_output=True, check=True
-        )
+        args = ['exiftool', '-overwrite_original']
+        if photographer:
+            args.append(f'-Artist={photographer}')
+        if datetime_str:
+            args.append(f'-DateTimeOriginal={datetime_str}')
+        args.append(path)
+        subprocess.run(args, capture_output=True, check=True, timeout=5)
         return True
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return False
 
 
@@ -180,21 +205,27 @@ def set_photographers(src_dir):
     """Set photographer EXIF field on all photos based on camera model."""
     stats = defaultdict(lambda: {'updated': 0, 'skipped': 0, 'error': 0})
     total = 0
+    paths = list(iter_media(src_dir))
+    total = len(paths)
 
-    for i, path in enumerate(iter_media(src_dir), 1):
-        total += 1
-        camera = get_camera_info(path)
-        if not camera:
+    # Batch read EXIF for all files
+    exif_cache = read_exif_batch(paths)
+
+    for i, path in enumerate(paths, 1):
+        exif_data = exif_cache.get(path, {})
+        make = exif_data.get('Make', '')
+        model = exif_data.get('Model', '')
+
+        if not make:
             stats['unknown']['skipped'] += 1
             continue
 
-        make, model = camera
         photographer = get_photographer(make, model)
         if not photographer:
             stats['unknown']['skipped'] += 1
             continue
 
-        if set_exif_artist(path, photographer):
+        if set_exif_fields(path, photographer=photographer):
             stats[photographer]['updated'] += 1
         else:
             stats[photographer]['error'] += 1
@@ -214,22 +245,26 @@ def set_photographers(src_dir):
 def set_dates(src_dir):
     """Set DateTimeOriginal on all photos from filename/path/other EXIF tags."""
     stats = {'updated': 0, 'skipped': 0, 'error': 0, 'already_set': 0}
-    total = 0
+    paths = list(iter_media(src_dir))
+    total = len(paths)
 
-    for i, path in enumerate(iter_media(src_dir), 1):
-        total += 1
-        exif_dates = get_exif_all_dates(path)
+    # Batch read EXIF for all files
+    exif_cache = read_exif_batch(paths)
+
+    for i, path in enumerate(paths, 1):
+        exif_dates = exif_cache.get(path, {})
 
         if exif_dates.get('DateTimeOriginal'):
             stats['already_set'] += 1
             continue
 
-        datetime_str = detect_datetime(path)
+        # Use cached EXIF as fallback; detect_datetime will check filename/path first
+        datetime_str = detect_datetime_with_cache(path, exif_dates)
         if not datetime_str:
             stats['skipped'] += 1
             continue
 
-        if set_exif_datetime(path, datetime_str):
+        if set_exif_fields(path, datetime_str=datetime_str):
             stats['updated'] += 1
         else:
             stats['error'] += 1
@@ -250,14 +285,20 @@ def report_photographers(src_dir):
     """Preview photographer assignments."""
     assignments = defaultdict(int)
     unknown = 0
+    paths = list(iter_media(src_dir))
 
-    for path in iter_media(src_dir):
-        camera = get_camera_info(path)
-        if not camera:
+    # Batch read EXIF for all files
+    exif_cache = read_exif_batch(paths)
+
+    for path in paths:
+        exif_data = exif_cache.get(path, {})
+        make = exif_data.get('Make', '')
+        model = exif_data.get('Model', '')
+
+        if not make:
             unknown += 1
             continue
 
-        make, model = camera
         photographer = get_photographer(make, model)
         if photographer:
             assignments[photographer] += 1
@@ -276,14 +317,18 @@ def report_dates(src_dir):
     has_date = 0
     can_detect = 0
     cannot_detect = 0
+    paths = list(iter_media(src_dir))
 
-    for path in iter_media(src_dir):
-        exif_dates = get_exif_all_dates(path)
+    # Batch read EXIF for all files
+    exif_cache = read_exif_batch(paths)
+
+    for path in paths:
+        exif_dates = exif_cache.get(path, {})
         if exif_dates.get('DateTimeOriginal'):
             has_date += 1
             continue
 
-        datetime_str = detect_datetime(path)
+        datetime_str = detect_datetime_with_cache(path, exif_dates)
         if datetime_str:
             can_detect += 1
         else:
