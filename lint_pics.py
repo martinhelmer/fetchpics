@@ -154,7 +154,7 @@ def check_heuristics(filepath):
         return 'HIGH', score, reasons, cached_dims, cached_duration
 
     # IMAGE-SPECIFIC HEURISTICS (still relatively fast)
-    if ext.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.tiff', '.tif'}:
+    if ext.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.tiff', '.tif'}:  # subset of PHOTO_EXTENSIONS
         dims, mode = get_image_dimensions(filepath)
         cached_dims = dims
 

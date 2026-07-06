@@ -26,29 +26,25 @@ CAMERA_TO_PHOTOGRAPHER = {
 }
 
 
+PHOTO_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.heic', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
+
+
 def iter_media(directory):
     """Iterate over all media files recursively."""
     for root, _, files in os.walk(directory, followlinks=False):
         for fname in files:
             path = os.path.join(root, fname)
             _, ext = os.path.splitext(path)
-            if ext.lower() in ('.jpg', '.jpeg', '.png', '.heic', '.gif', '.bmp', '.webp', '.tiff', '.tif'):
+            if ext.lower() in PHOTO_EXTENSIONS:
                 yield path
 
 
-def get_camera_info(path):
-    """Get Make and Model from file EXIF."""
-    try:
-        result = subprocess.run(
-            ['exiftool', '-json', '-Make', '-Model', path],
-            capture_output=True, text=True, check=True
-        )
-        data = json.loads(result.stdout)[0]
-        make = data.get('Make', '').lower()
-        model = data.get('Model', '')
-        return (make, model)
-    except Exception:
-        return None
+def iter_media_with_exif(directory):
+    """Yields (path, exif_data) tuples; batch-reads EXIF once for efficiency."""
+    paths = list(iter_media(directory))
+    exif_cache = read_exif_batch(paths)
+    for path in paths:
+        yield path, exif_cache.get(path, {})
 
 
 def get_photographer(make, model):
@@ -131,30 +127,6 @@ def read_exif_batch(paths):
         return {}
 
 
-def get_exif_all_dates(path):
-    """Get all date-related EXIF tags from file."""
-    try:
-        result = subprocess.run(
-            ['exiftool', '-json', '-DateTimeOriginal', '-CreateDate', '-ModifyDate', '-FileModifyDate', path],
-            capture_output=True, text=True, check=True
-        )
-        data = json.loads(result.stdout)[0]
-        return {
-            'DateTimeOriginal': data.get('DateTimeOriginal'),
-            'CreateDate': data.get('CreateDate'),
-            'ModifyDate': data.get('ModifyDate'),
-            'FileModifyDate': data.get('FileModifyDate'),
-        }
-    except Exception:
-        return {}
-
-
-def detect_datetime(path):
-    """Detect datetime from EXIF, filename, path, or file mtime (in order of priority)."""
-    exif_dates = get_exif_all_dates(path)
-    return detect_datetime_with_cache(path, exif_dates)
-
-
 def detect_datetime_with_cache(path, exif_dates):
     """Detect datetime using pre-read EXIF data to avoid re-reading."""
     if exif_dates.get('DateTimeOriginal'):
@@ -204,23 +176,12 @@ def set_exif_fields(path, photographer=None, datetime_str=None):
 def set_photographers(src_dir):
     """Set photographer EXIF field on all photos based on camera model."""
     stats = defaultdict(lambda: {'updated': 0, 'skipped': 0, 'error': 0})
-    total = 0
-    paths = list(iter_media(src_dir))
-    total = len(paths)
 
-    # Batch read EXIF for all files
-    exif_cache = read_exif_batch(paths)
-
-    for i, path in enumerate(paths, 1):
-        exif_data = exif_cache.get(path, {})
+    for i, (path, exif_data) in enumerate(iter_media_with_exif(src_dir), 1):
         make = exif_data.get('Make', '')
         model = exif_data.get('Model', '')
-
-        if not make:
-            stats['unknown']['skipped'] += 1
-            continue
-
         photographer = get_photographer(make, model)
+
         if not photographer:
             stats['unknown']['skipped'] += 1
             continue
@@ -234,7 +195,7 @@ def set_photographers(src_dir):
             print(f"  Processed {i} files...", end='\r')
             sys.stdout.flush()
 
-    print(f"\nProcessed {total} files\n")
+    print(f"\nProcessed {i} files\n")
     for photographer, counts in sorted(stats.items()):
         print(f"{photographer}:")
         print(f"  Updated: {counts['updated']}")
@@ -245,20 +206,12 @@ def set_photographers(src_dir):
 def set_dates(src_dir):
     """Set DateTimeOriginal on all photos from filename/path/other EXIF tags."""
     stats = {'updated': 0, 'skipped': 0, 'error': 0, 'already_set': 0}
-    paths = list(iter_media(src_dir))
-    total = len(paths)
 
-    # Batch read EXIF for all files
-    exif_cache = read_exif_batch(paths)
-
-    for i, path in enumerate(paths, 1):
-        exif_dates = exif_cache.get(path, {})
-
+    for i, (path, exif_dates) in enumerate(iter_media_with_exif(src_dir), 1):
         if exif_dates.get('DateTimeOriginal'):
             stats['already_set'] += 1
             continue
 
-        # Use cached EXIF as fallback; detect_datetime will check filename/path first
         datetime_str = detect_datetime_with_cache(path, exif_dates)
         if not datetime_str:
             stats['skipped'] += 1
@@ -273,7 +226,7 @@ def set_dates(src_dir):
             print(f"  Processed {i} files...", end='\r')
             sys.stdout.flush()
 
-    print(f"\nProcessed {total} files\n")
+    print(f"\nProcessed {i} files\n")
     print(f"Updated: {stats['updated']}")
     print(f"Already set: {stats['already_set']}")
     print(f"Skipped (no date found): {stats['skipped']}")
@@ -285,21 +238,12 @@ def report_photographers(src_dir):
     """Preview photographer assignments."""
     assignments = defaultdict(int)
     unknown = 0
-    paths = list(iter_media(src_dir))
 
-    # Batch read EXIF for all files
-    exif_cache = read_exif_batch(paths)
-
-    for path in paths:
-        exif_data = exif_cache.get(path, {})
+    for path, exif_data in iter_media_with_exif(src_dir):
         make = exif_data.get('Make', '')
         model = exif_data.get('Model', '')
-
-        if not make:
-            unknown += 1
-            continue
-
         photographer = get_photographer(make, model)
+
         if photographer:
             assignments[photographer] += 1
         else:
@@ -317,13 +261,8 @@ def report_dates(src_dir):
     has_date = 0
     can_detect = 0
     cannot_detect = 0
-    paths = list(iter_media(src_dir))
 
-    # Batch read EXIF for all files
-    exif_cache = read_exif_batch(paths)
-
-    for path in paths:
-        exif_dates = exif_cache.get(path, {})
+    for path, exif_dates in iter_media_with_exif(src_dir):
         if exif_dates.get('DateTimeOriginal'):
             has_date += 1
             continue
