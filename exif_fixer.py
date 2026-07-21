@@ -49,7 +49,13 @@ def iter_media_batches(directories, batch_size=200):
         batch = paths[i:i+batch_size]
         exif_cache = read_exif_batch(batch)
         for path in batch:
-            yield path, exif_cache.get(path, {})
+            try:
+                # Test if path is encodable; skip if not
+                path.encode('utf-8')
+                yield path, exif_cache.get(path, {})
+            except (UnicodeDecodeError, UnicodeEncodeError) as e:
+                print(f"Warning: Skipping file with encoding error: {path!r} ({e})", file=sys.stderr)
+                continue
 
 
 def get_photographer(make, model):
@@ -146,13 +152,19 @@ def detect_datetime_with_cache(path, exif_dates):
     if exif_dates.get('DateTimeOriginal'):
         return exif_dates['DateTimeOriginal']
 
-    datetime_from_filename = parse_datetime_from_filename(os.path.basename(path))
-    if datetime_from_filename:
-        return datetime_from_filename
+    try:
+        datetime_from_filename = parse_datetime_from_filename(os.path.basename(path))
+        if datetime_from_filename:
+            return datetime_from_filename
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        pass
 
-    datetime_from_path = parse_datetime_from_path(path)
-    if datetime_from_path:
-        return datetime_from_path
+    try:
+        datetime_from_path = parse_datetime_from_path(path)
+        if datetime_from_path:
+            return datetime_from_path
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        pass
 
     if exif_dates.get('CreateDate'):
         return exif_dates['CreateDate']
