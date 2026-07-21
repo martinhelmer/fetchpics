@@ -42,12 +42,14 @@ def iter_media(directories):
                     yield path
 
 
-def iter_media_with_exif(directory):
-    """Yields (path, exif_data) tuples; batch-reads EXIF once for efficiency."""
-    paths = list(iter_media(directory))
-    exif_cache = read_exif_batch(paths)
-    for path in paths:
-        yield path, exif_cache.get(path, {})
+def iter_media_batches(directories, batch_size=200):
+    """Yields batches of (path, exif_data) tuples; reads and processes 200 at a time."""
+    paths = list(iter_media(directories))
+    for i in range(0, len(paths), batch_size):
+        batch = paths[i:i+batch_size]
+        exif_cache = read_exif_batch(batch)
+        for path in batch:
+            yield path, exif_cache.get(path, {})
 
 
 def get_photographer(make, model):
@@ -102,41 +104,39 @@ def parse_datetime_from_path(full_path):
     return None
 
 
-def read_exif_batch(paths, batch_size=500):
-    """Read EXIF data for multiple files in chunks. Returns dict: path -> exif_data."""
+def read_exif_batch(paths):
+    """Read EXIF data for a batch of files. Returns dict: path -> exif_data."""
     if not paths:
         return {}
 
     cache = {}
-    for i in range(0, len(paths), batch_size):
-        chunk = paths[i:i+batch_size]
-        try:
-            result = subprocess.run(
-                ['exiftool', '-json', '-DateTimeOriginal', '-CreateDate', '-ModifyDate',
-                 '-FileModifyDate', '-Make', '-Model'] + list(chunk),
-                capture_output=True, text=True, check=True, timeout=300
-            )
-            data = json.loads(result.stdout)
-            for entry in data:
-                path = entry.get('SourceFile')
-                if path:
-                    cache[path] = {
-                        'DateTimeOriginal': entry.get('DateTimeOriginal'),
-                        'CreateDate': entry.get('CreateDate'),
-                        'ModifyDate': entry.get('ModifyDate'),
-                        'FileModifyDate': entry.get('FileModifyDate'),
-                        'Make': entry.get('Make', '').lower(),
-                        'Model': entry.get('Model', ''),
-                    }
-        except subprocess.TimeoutExpired:
-            print(f"  Warning: exiftool batch timeout on {len(chunk)} files (batch {i//batch_size})", file=sys.stderr)
-            raise
-        except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
-            print(f"  Error: exiftool batch failed on {len(chunk)} files: {e}", file=sys.stderr)
-            raise
-        except Exception as e:
-            print(f"  Error: unexpected failure reading EXIF batch: {e}", file=sys.stderr)
-            raise
+    try:
+        result = subprocess.run(
+            ['exiftool', '-json', '-DateTimeOriginal', '-CreateDate', '-ModifyDate',
+             '-FileModifyDate', '-Make', '-Model'] + list(paths),
+            capture_output=True, text=True, check=True, timeout=300
+        )
+        data = json.loads(result.stdout)
+        for entry in data:
+            path = entry.get('SourceFile')
+            if path:
+                cache[path] = {
+                    'DateTimeOriginal': entry.get('DateTimeOriginal'),
+                    'CreateDate': entry.get('CreateDate'),
+                    'ModifyDate': entry.get('ModifyDate'),
+                    'FileModifyDate': entry.get('FileModifyDate'),
+                    'Make': entry.get('Make', '').lower(),
+                    'Model': entry.get('Model', ''),
+                }
+    except subprocess.TimeoutExpired:
+        print(f"  Warning: exiftool batch timeout on {len(paths)} files", file=sys.stderr)
+        raise
+    except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
+        print(f"  Error: exiftool batch failed on {len(paths)} files: {e}", file=sys.stderr)
+        raise
+    except Exception as e:
+        print(f"  Error: unexpected failure reading EXIF batch: {e}", file=sys.stderr)
+        raise
 
     return cache
 
@@ -189,18 +189,19 @@ def set_exif_fields(path, photographer=None, datetime_str=None):
         return False
 
 
-def set_photographers(src_dir):
+def set_photographers(src_dirs):
     """Set photographer EXIF field on all photos based on camera model."""
     stats = defaultdict(lambda: {'updated': 0, 'skipped': 0, 'error': 0})
-    i = 0
+    total = 0
 
-    for i, (path, exif_data) in enumerate(iter_media_with_exif(src_dir), 1):
+    for path, exif_data in iter_media_batches(src_dirs):
         make = exif_data.get('Make', '')
         model = exif_data.get('Model', '')
         photographer = get_photographer(make, model)
 
         if not photographer:
             stats['unknown']['skipped'] += 1
+            total += 1
             continue
 
         if set_exif_fields(path, photographer=photographer):
@@ -208,11 +209,12 @@ def set_photographers(src_dir):
         else:
             stats[photographer]['error'] += 1
 
-        if i % 50 == 0:
-            print(f"  Processed {i} files...", end='\r')
+        total += 1
+        if total % 200 == 0:
+            print(f"  Processed {total} files...", end='\r')
             sys.stdout.flush()
 
-    print(f"\nProcessed {i} files\n")
+    print(f"\nProcessed {total} files\n")
     for photographer, counts in sorted(stats.items()):
         print(f"{photographer}:")
         print(f"  Updated: {counts['updated']}")
@@ -220,19 +222,21 @@ def set_photographers(src_dir):
             print(f"  Errors: {counts['error']}")
 
 
-def set_dates(src_dir):
+def set_dates(src_dirs):
     """Set DateTimeOriginal on all photos from filename/path/other EXIF tags."""
     stats = {'updated': 0, 'skipped': 0, 'error': 0, 'already_set': 0}
-    i = 0
+    total = 0
 
-    for i, (path, exif_dates) in enumerate(iter_media_with_exif(src_dir), 1):
+    for path, exif_dates in iter_media_batches(src_dirs):
         if exif_dates.get('DateTimeOriginal'):
             stats['already_set'] += 1
+            total += 1
             continue
 
         datetime_str = detect_datetime_with_cache(path, exif_dates)
         if not datetime_str:
             stats['skipped'] += 1
+            total += 1
             continue
 
         if set_exif_fields(path, datetime_str=datetime_str):
@@ -240,11 +244,12 @@ def set_dates(src_dir):
         else:
             stats['error'] += 1
 
-        if i % 50 == 0:
-            print(f"  Processed {i} files...", end='\r')
+        total += 1
+        if total % 200 == 0:
+            print(f"  Processed {total} files...", end='\r')
             sys.stdout.flush()
 
-    print(f"\nProcessed {i} files\n")
+    print(f"\nProcessed {total} files\n")
     print(f"Updated: {stats['updated']}")
     print(f"Already set: {stats['already_set']}")
     print(f"Skipped (no date found): {stats['skipped']}")
@@ -252,12 +257,12 @@ def set_dates(src_dir):
         print(f"Errors: {stats['error']}")
 
 
-def report_photographers(src_dir):
+def report_photographers(src_dirs):
     """Preview photographer assignments."""
     assignments = defaultdict(int)
     unknown = 0
 
-    for path, exif_data in iter_media_with_exif(src_dir):
+    for path, exif_data in iter_media_batches(src_dirs):
         make = exif_data.get('Make', '')
         model = exif_data.get('Model', '')
         photographer = get_photographer(make, model)
@@ -274,13 +279,13 @@ def report_photographers(src_dir):
         print(f"  Unknown: {unknown} files")
 
 
-def report_dates(src_dir):
+def report_dates(src_dirs):
     """Preview date detection for files missing DateTimeOriginal."""
     has_date = 0
     can_detect = 0
     cannot_detect = 0
 
-    for path, exif_dates in iter_media_with_exif(src_dir):
+    for path, exif_dates in iter_media_batches(src_dirs):
         if exif_dates.get('DateTimeOriginal'):
             has_date += 1
             continue
