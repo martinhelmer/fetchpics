@@ -111,7 +111,8 @@ def parse_datetime_from_path(full_path):
 
 
 def read_exif_batch(paths):
-    """Read EXIF data for a batch of files. Returns dict: path -> exif_data."""
+    """Read EXIF data for a batch of files. Returns dict: path -> exif_data.
+    Falls back to individual file reads if batch fails due to encoding issues."""
     if not paths:
         return {}
 
@@ -120,9 +121,15 @@ def read_exif_batch(paths):
         result = subprocess.run(
             ['exiftool', '-json', '-DateTimeOriginal', '-CreateDate', '-ModifyDate',
              '-FileModifyDate', '-Make', '-Model'] + list(paths),
-            capture_output=True, text=True, check=True, timeout=300
+            capture_output=True, check=True, timeout=300
         )
-        data = json.loads(result.stdout)
+        try:
+            output = result.stdout.decode('utf-8', errors='strict')
+        except UnicodeDecodeError:
+            # Batch contains bad UTF-8; read files individually to isolate bad ones
+            return _read_exif_individually(paths)
+
+        data = json.loads(output)
         for entry in data:
             path = entry.get('SourceFile')
             if path:
@@ -143,6 +150,45 @@ def read_exif_batch(paths):
     except Exception as e:
         print(f"  Error: unexpected failure reading EXIF batch: {e}", file=sys.stderr)
         raise
+
+    return cache
+
+
+def _read_exif_individually(paths):
+    """Read EXIF data file-by-file, skipping files with encoding errors."""
+    cache = {}
+    for path in paths:
+        try:
+            result = subprocess.run(
+                ['exiftool', '-json', '-DateTimeOriginal', '-CreateDate', '-ModifyDate',
+                 '-FileModifyDate', '-Make', '-Model', path],
+                capture_output=True, check=True, timeout=30
+            )
+            try:
+                output = result.stdout.decode('utf-8', errors='strict')
+            except UnicodeDecodeError as e:
+                print(f"Warning: Skipping file with bad EXIF encoding: {path!r} ({e})", file=sys.stderr)
+                continue
+
+            data = json.loads(output)
+            if data:
+                entry = data[0]
+                entry_path = entry.get('SourceFile')
+                if entry_path:
+                    cache[entry_path] = {
+                        'DateTimeOriginal': entry.get('DateTimeOriginal'),
+                        'CreateDate': entry.get('CreateDate'),
+                        'ModifyDate': entry.get('ModifyDate'),
+                        'FileModifyDate': entry.get('FileModifyDate'),
+                        'Make': entry.get('Make', '').lower(),
+                        'Model': entry.get('Model', ''),
+                    }
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, json.JSONDecodeError):
+            # Individual file read failed; skip silently (exiftool already warned)
+            continue
+        except Exception as e:
+            print(f"Warning: Failed to read EXIF for {path!r}: {e}", file=sys.stderr)
+            continue
 
     return cache
 
