@@ -279,6 +279,12 @@ def cmd_organize(args):
 
                     dest_path = os.path.join(dest_dir, os.path.basename(path))
 
+                    # Skip if already in correct position
+                    if os.path.normpath(path) == os.path.normpath(dest_path):
+                        organized += 1
+                        print("  {0:04d}-{1:02d}  {2} (already organized)".format(year, month, os.path.basename(path)))
+                        continue
+
                     # Handle collisions
                     if os.path.exists(dest_path):
                         base, ext = os.path.splitext(os.path.basename(path))
